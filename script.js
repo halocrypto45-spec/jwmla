@@ -14,12 +14,16 @@ import {
   query,
   orderBy,
   serverTimestamp,
-  storage,
-  ref,
-  uploadBytes,
-  getDownloadURL,
-  deleteObject,
 } from "./firebase.js";
+
+/* --------------------------------------------------------------------------
+   Image handling constants (Base64-in-Firestore, no Storage — Spark plan safe)
+   Images are downsized/compressed client-side before being turned into
+   Base64 strings, to keep each product document comfortably under
+   Firestore's 1 MiB document limit while still looking sharp.
+   -------------------------------------------------------------------------- */
+const IMAGE_MAX_DIMENSION = 1000; // longest side, in pixels, after resizing
+const IMAGE_JPEG_QUALITY = 0.72; // 0–1, compression quality for the output JPEG
 
 /* --------------------------------------------------------------------------
    0. ADMIN PASSWORD (client-side gate only, per project spec)
@@ -595,20 +599,73 @@ editModalOverlay.addEventListener("click", (e) => {
   if (e.target === editModalOverlay) closeEditModal();
 });
 
-// New images picked from camera or photo library
-fieldImages.addEventListener("change", () => {
+// New images picked from camera or photo library.
+// Each file is read with FileReader, downsized on a canvas, and converted
+// straight to a Base64 JPEG string — no Storage upload involved.
+fieldImages.addEventListener("change", async () => {
   const files = Array.from(fieldImages.files || []);
-  files.forEach((file) => {
-    pendingImages.push({ file, previewUrl: URL.createObjectURL(file) });
-  });
   fieldImages.value = ""; // allow re-selecting the same file later
-  renderImagePreviews();
+  if (!files.length) return;
+
+  const dict = translations[currentLang];
+  formStatus.textContent = dict.uploading;
+  formStatus.className = "form-status";
+
+  for (const file of files) {
+    try {
+      const base64 = await fileToCompressedBase64(file);
+      pendingImages.push({ base64 });
+      renderImagePreviews();
+    } catch (err) {
+      console.error("Image processing failed:", err);
+      formStatus.textContent = err.message || "Couldn't process that image.";
+      formStatus.className = "form-status error";
+    }
+  }
+
+  formStatus.textContent = "";
 });
+
+/**
+ * Reads a File with FileReader, draws it onto a canvas capped to
+ * IMAGE_MAX_DIMENSION on its longest side, and resolves with a compressed
+ * Base64 JPEG data URL (e.g. "data:image/jpeg;base64,...").
+ */
+function fileToCompressedBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Couldn't read that file."));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Couldn't read that image."));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > IMAGE_MAX_DIMENSION || height > IMAGE_MAX_DIMENSION) {
+          if (width >= height) {
+            height = Math.round((height * IMAGE_MAX_DIMENSION) / width);
+            width = IMAGE_MAX_DIMENSION;
+          } else {
+            width = Math.round((width * IMAGE_MAX_DIMENSION) / height);
+            height = IMAGE_MAX_DIMENSION;
+          }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", IMAGE_JPEG_QUALITY));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 function renderImagePreviews() {
   imagePreviewGrid.innerHTML = "";
   pendingImages.forEach((img, i) => {
-    const src = img.previewUrl || img.existingUrl;
+    const src = img.base64 || img.existingUrl;
     const item = document.createElement("div");
     item.className = "image-preview-item";
     item.innerHTML = `
@@ -638,21 +695,11 @@ productForm.addEventListener("submit", async (e) => {
   formStatus.className = "form-status";
 
   try {
-    // 1. Upload any new image files to Firebase Storage
-    const finalImageUrls = [];
-    for (let i = 0; i < pendingImages.length; i++) {
-      const img = pendingImages[i];
-      if (img.existingUrl) {
-        finalImageUrls.push(img.existingUrl);
-      } else if (img.file) {
-        formStatus.textContent = `${dict.uploading} (${i + 1}/${pendingImages.length})`;
-        const path = `products/${Date.now()}_${i}_${img.file.name}`;
-        const storageRef = ref(storage, path);
-        await uploadBytes(storageRef, img.file);
-        const url = await getDownloadURL(storageRef);
-        finalImageUrls.push(url);
-      }
-    }
+    // Build the images array straight from Base64 strings — existing images
+    // (already Base64, loaded from Firestore) and newly picked images
+    // (already converted to Base64 by fileToCompressedBase64 on selection)
+    // are both plain strings at this point, so no async upload step is needed.
+    const finalImageUrls = pendingImages.map((img) => img.existingUrl || img.base64);
 
     formStatus.textContent = dict.savingProduct;
 
@@ -689,7 +736,10 @@ productForm.addEventListener("submit", async (e) => {
 });
 
 /* --------------------------------------------------------------------------
-   8. Delete product (Firestore doc + its images in Storage)
+   8. Delete product
+   Images live inside the product document itself (as Base64 strings), so
+   deleting the Firestore doc removes the images too — there's no separate
+   Storage object to clean up.
    -------------------------------------------------------------------------- */
 async function deleteProduct(product) {
   const dict = translations[currentLang];
@@ -697,17 +747,6 @@ async function deleteProduct(product) {
 
   try {
     await deleteDoc(doc(productsCol, product.id));
-
-    // Best-effort cleanup of stored images; ignore failures (e.g. external URLs)
-    (product.images || []).forEach((url) => {
-      try {
-        const storageRef = ref(storage, url);
-        deleteObject(storageRef).catch(() => {});
-      } catch (_) {
-        /* URL wasn't a Storage ref (e.g. placeholder) — skip */
-      }
-    });
-
     showToast(dict.productDeleted);
   } catch (err) {
     console.error("Delete failed:", err);
